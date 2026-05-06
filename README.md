@@ -13,11 +13,17 @@ This project helps users debug issues with AI by fetching New Relic logs through
 
 ## Tooling included
 
-- search_logs
-- get_error_logs
-- summarize_log_patterns
-- discover_infra_context
-- dry_run_query
+| Tool | Description |
+|---|---|
+| `search_logs` | Run any read-only NRQL query against your log tables |
+| `get_error_logs` | Fetch recent error logs with optional service filter |
+| `summarize_log_patterns` | Top error patterns grouped by service and message |
+| `discover_infra_context` | Discover services, hosts, clusters from log data |
+| `discover_log_schema` | Inspect available log fields and sample values |
+| `get_account_context` | Show account + auth status and recent log count |
+| `dry_run_query` | Validate and normalize a NRQL query without executing it |
+| `build_memory_bank` | **Run once.** Discovers all log tables, schemas, and custom fields and writes a local context file |
+| `get_memory_bank` | Read the cached context file for debugging/inspection of discovered mappings |
 
 ## Requirements
 
@@ -67,13 +73,14 @@ export NEW_RELIC_COOKIE=""
     "newrelic-lite-logs-mcp": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "github:bhargavprajapati949/newrelic-lite-logs-mcp#main"],
+      "args": ["-y", "github:bhargavprajapati949/newrelic-lite-logs-mcp"],
       "env": {
         "NEW_RELIC_DEFAULT_AUTH_MODE": "api_key_only",
         "NEW_RELIC_ACCOUNT_ID": "${env:NEW_RELIC_ACCOUNT_ID}",
         "NEW_RELIC_API_KEY": "${env:NEW_RELIC_API_KEY}",
         "NEW_RELIC_COOKIE": "${env:NEW_RELIC_COOKIE}",
-        "NEW_RELIC_VERBOSE_LOGS": "0"
+        "NEW_RELIC_VERBOSE_LOGS": "0",
+        "NR_MEMORY_BANK_PATH": "${env:HOME}/.newrelic-mcp/context.json"
       }
     }
   }
@@ -83,11 +90,39 @@ export NEW_RELIC_COOKIE=""
 3. Restart VS Code.
 4. Open MCP server list/dropdown.
 5. Start/select newrelic-lite-logs-mcp.
-6. Ask the AI to call search_logs or get_error_logs.
+6. **First time only:** ask the AI to call `build_memory_bank`. This discovers all your log tables and writes `~/.newrelic-mcp/context.json`.
+7. Ask the AI to call `search_logs` or `get_error_logs`.
 
 ## VS Code setup for local development
 
 Project-level config is available in .vscode/mcp.json and runs dist/index.js from the workspace.
+
+## Memory bank
+
+The memory bank solves a common problem: your infra may push logs into custom event types (`Log_produs`, `Log_prodeu`, `Log_internal`, …) with custom field names (`container_name`, `region`, …) that the AI has no way of knowing about ahead of time.
+
+**How it works:**
+
+1. Call `build_memory_bank` once (or whenever your infra changes). It runs:
+   - `SHOW EVENT TYPES` → finds all log-like tables
+   - `keyset()` per table → all field names
+   - `FACET` queries → sample values for custom fields
+2. Results are written to a local JSON file (default: `~/.newrelic-mcp/context.json`).
+3. The MCP server automatically reads this local file for routing/validation, so query tools can use the correct table names and fields without an extra call.
+
+**Customising the file location:**
+
+Set `NR_MEMORY_BANK_PATH` to any absolute path:
+
+```bash
+export NR_MEMORY_BANK_PATH="/path/to/your/nr-context.json"
+```
+
+Or pass it in the VS Code `mcp.json` `env` block (shown in the example above).
+
+`get_memory_bank` remains available when you want to inspect the cached context manually.
+
+**Re-run after infra changes** — new log tables, new custom fields, or renamed containers will not be visible until you run `build_memory_bank` again.
 
 ## Authentication modes
 
@@ -131,8 +166,17 @@ Coverage artifacts are uploaded in each run.
 
 ## Release notes
 
-- For stable installs, pin to a tag instead of main.
-- Example pinned source: github:YOUR_GITHUB_OWNER/newrelic-lite-logs-mcp#v1.0.0
+Choose one update mode:
+
+- Always latest code (auto-updates from default branch):
+  - `github:bhargavprajapati949/newrelic-lite-logs-mcp`
+- Pinned stable version (manual upgrade when you change the tag):
+  - `github:bhargavprajapati949/newrelic-lite-logs-mcp#v1.0.1`
+
+Important:
+
+- GitHub source installs do not have a built-in "always newest release tag" mode.
+- If you want strict release tags, update the tag in `mcp.json` when a new release is published.
 
 ## Security checklist
 

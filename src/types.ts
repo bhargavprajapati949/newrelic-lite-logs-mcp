@@ -72,3 +72,35 @@ export interface InfraContext {
   fieldMapping: FieldMapping;
   source: string;
 }
+
+export interface MemoryBankTable {
+  name: string;
+  /** All field names from keyset(). */
+  fields: string[];
+  /** Fields that are not standard New Relic log fields. */
+  customFields: string[];
+  /** Top values sampled for each interesting custom field. */
+  fieldSamples: Record<string, string[]>;
+  /** Approximate row count over the discovery window. */
+  estimatedRows: number;
+  /** SINCE clause used during discovery. */
+  windowUsed: string;
+  latestTimestamp: string | null;
+  earliestTimestamp: string | null;
+}
+
+export interface MemoryBank {
+  version: "1";
+  builtAt: string;
+  accountId: number;
+  authMode: AuthMode;
+  /** All discovered log-like event type names. */
+  logTables: string[];
+  /** Table with the most data — the default target for queries. */
+  primaryTable: string;
+  tables: Record<string, MemoryBankTable>;
+  /** Custom fields that appear across one or more tables. */
+  globalCustomFields: string[];
+  /** Human-readable summary the AI agent should read before constructing queries. */
+  agentHint: string;
+}

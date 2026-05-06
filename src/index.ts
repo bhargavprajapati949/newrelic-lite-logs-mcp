@@ -7,6 +7,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { buildZeroResultDiagnostics, discoverInfraContext, discoverLogSchema, getAccountContext } from "./log-discovery.js";
+import { buildMemoryBank, getMemoryBankPath, readMemoryBank } from "./memory-bank.js";
 import { buildClientFromEnv } from "./newrelic.js";
 import {
   decodePageToken,
@@ -73,7 +74,31 @@ const dryRunSchema = z.object({
   limit: z.number().int().positive().max(MAX_LIMIT).optional(),
 });
 
+const buildMemoryBankSchema = z.object({
+  accountId: z.number().int().positive().optional(),
+});
+
 const client = buildClientFromEnv();
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function routeQueryWithMemoryBank(rawQuery: string): Promise<{ query: string; note?: string }> {
+  const bank = await readMemoryBank();
+  if (!bank || !bank.primaryTable || bank.primaryTable === "Log") {
+    return { query: rawQuery };
+  }
+
+  if (!/\bFROM\s+Log\b/i.test(rawQuery)) {
+    return { query: rawQuery };
+  }
+
+  return {
+    query: rawQuery.replace(/\bFROM\s+Log\b/i, `FROM ${bank.primaryTable}`),
+    note: `Auto-routed FROM Log to FROM ${bank.primaryTable} using local memory bank.`,
+  };
+}
 
 function textResult(payload: unknown) {
   return {
@@ -112,12 +137,14 @@ function classifyError(error: unknown): { type: string; message: string } {
 }
 
 async function executeQuery(rawQuery: string, options: { accountId?: number; since?: string; until?: string; limit?: number; pageToken?: string }): Promise<QueryResult> {
-  enforceReadOnlyQuery(rawQuery);
-  ensureTimeBound(rawQuery, options.since, options.until);
+  const routed = await routeQueryWithMemoryBank(rawQuery);
+
+  enforceReadOnlyQuery(routed.query);
+  ensureTimeBound(routed.query, options.since, options.until);
 
   const limit = Math.min(options.limit ?? 200, MAX_LIMIT);
   const offset = decodePageToken(options.pageToken);
-  const query = withOffset(injectWindowAndLimit(rawQuery, options.since, options.until, limit), offset);
+  const query = withOffset(injectWindowAndLimit(routed.query, options.since, options.until, limit), offset);
 
   const startedAt = Date.now();
   const rows = await client.runNrql(query, options.accountId);
@@ -137,7 +164,7 @@ async function executeQuery(rawQuery: string, options: { accountId?: number; sin
   }) : undefined;
 
   return {
-    summary: `Fetched ${rows.length} rows in ${durationMs}ms using ${client.authMode}.`,
+    summary: `Fetched ${rows.length} rows in ${durationMs}ms using ${client.authMode}.${routed.note ? ` ${routed.note}` : ""}`,
     query,
     rows: redacted,
     accountContext,
@@ -154,14 +181,40 @@ async function executeQuery(rawQuery: string, options: { accountId?: number; sin
   };
 }
 
-function makeDryRun(rawQuery: string, options: { since?: string; until?: string; limit?: number }): DryRunResult {
-  enforceReadOnlyQuery(rawQuery);
-  ensureTimeBound(rawQuery, options.since, options.until);
+async function makeDryRun(rawQuery: string, options: { since?: string; until?: string; limit?: number }): Promise<DryRunResult> {
+  const routed = await routeQueryWithMemoryBank(rawQuery);
 
-  const normalizedQuery = injectWindowAndLimit(rawQuery, options.since, options.until, Math.min(options.limit ?? 200, MAX_LIMIT));
+  enforceReadOnlyQuery(routed.query);
+  ensureTimeBound(routed.query, options.since, options.until);
+
+  const normalizedQuery = injectWindowAndLimit(routed.query, options.since, options.until, Math.min(options.limit ?? 200, MAX_LIMIT));
   const warnings: string[] = [];
 
-  if (!/\bFROM\s+Log\b/i.test(normalizedQuery)) {
+  const memoryBank = await readMemoryBank();
+  if (routed.note) {
+    warnings.push(routed.note);
+  }
+
+  if (memoryBank && memoryBank.logTables.length > 0) {
+    const queryTargetsStandardLog = /\bFROM\s+Log\b/i.test(normalizedQuery);
+    const hasCustomTables = memoryBank.logTables.some((t) => t !== "Log");
+
+    if (queryTargetsStandardLog && hasCustomTables) {
+      warnings.push(
+        `Memory bank shows custom log tables: ${memoryBank.logTables.join(", ")}. ` +
+        `Consider querying FROM ${memoryBank.primaryTable} instead of the standard Log table.`,
+      );
+    }
+
+    const targetsKnownTable = memoryBank.logTables.some((tableName) => {
+      const re = new RegExp(`\\bFROM\\s+${escapeRegExp(tableName)}\\b`, "i");
+      return re.test(normalizedQuery);
+    });
+
+    if (!targetsKnownTable && !queryTargetsStandardLog) {
+      warnings.push("Query does not target any known log table. Call get_memory_bank to see available tables.");
+    }
+  } else if (!/\bFROM\s+Log\b/i.test(normalizedQuery)) {
     warnings.push("Query does not explicitly target Log events.");
   }
 
@@ -272,6 +325,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "build_memory_bank",
+      description:
+        "Discover all log event types, their schemas, custom fields, and sample values in this New Relic account, then write a persistent local context file. " +
+        "Run this once (or whenever infrastructure changes) so that subsequent queries use the correct table names and field names. " +
+        "The file is stored at NR_MEMORY_BANK_PATH or ~/.newrelic-mcp/context.json.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          accountId: { type: "number", description: "Override the default account ID." },
+        },
+      },
+    },
+    {
+      name: "get_memory_bank",
+      description:
+        "Read the locally cached New Relic context file built by build_memory_bank. " +
+        "Useful for debugging or inspecting discovered table/field mappings. " +
+        "If the file does not exist yet, this tool will tell you to run build_memory_bank first.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
+    {
       name: "dry_run_query",
       description: "Validate and normalize a read-only NRQL query without execution.",
       inputSchema: {
@@ -354,9 +431,68 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
     }
 
+    if (name === "build_memory_bank") {
+      const parsed = buildMemoryBankSchema.parse(args ?? {});
+      const { bank, filePath } = await buildMemoryBank(client, { accountId: parsed.accountId });
+      return textResult({
+        summary: `Memory bank built for account ${bank.accountId}. Found ${bank.logTables.length} log table(s): ${bank.logTables.join(", ")}.`,
+        filePath,
+        primaryTable: bank.primaryTable,
+        logTables: bank.logTables,
+        globalCustomFields: bank.globalCustomFields,
+        agentHint: bank.agentHint,
+        tableSchemas: Object.fromEntries(
+          Object.entries(bank.tables).map(([name, t]) => [
+            name,
+            {
+              estimatedRows: t.estimatedRows,
+              windowUsed: t.windowUsed,
+              customFields: t.customFields,
+              fieldSamples: t.fieldSamples,
+              totalFields: t.fields.length,
+            },
+          ]),
+        ),
+      });
+    }
+
+    if (name === "get_memory_bank") {
+      const bank = await readMemoryBank();
+      if (!bank) {
+        return textResult({
+          found: false,
+          filePath: getMemoryBankPath(),
+          message: "No memory bank found. Call build_memory_bank first to discover your New Relic log table structure.",
+        });
+      }
+
+      return textResult({
+        found: true,
+        filePath: getMemoryBankPath(),
+        builtAt: bank.builtAt,
+        accountId: bank.accountId,
+        primaryTable: bank.primaryTable,
+        logTables: bank.logTables,
+        globalCustomFields: bank.globalCustomFields,
+        agentHint: bank.agentHint,
+        tableSchemas: Object.fromEntries(
+          Object.entries(bank.tables).map(([name, t]) => [
+            name,
+            {
+              estimatedRows: t.estimatedRows,
+              windowUsed: t.windowUsed,
+              customFields: t.customFields,
+              fieldSamples: t.fieldSamples,
+              totalFields: t.fields.length,
+            },
+          ]),
+        ),
+      });
+    }
+
     if (name === "dry_run_query") {
       const parsed = dryRunSchema.parse(args ?? {});
-      return textResult(makeDryRun(parsed.query, parsed));
+      return textResult(await makeDryRun(parsed.query, parsed));
     }
 
     throw new Error(`Unknown tool: ${name}`);
