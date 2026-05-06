@@ -2,7 +2,7 @@
 
 Read-only New Relic Logs MCP server for VS Code.
 
-This project helps teams use AI to debug issues by fetching New Relic logs through MCP without requiring a premium New Relic MCP plan.
+This project helps users debug issues with AI by fetching New Relic logs through MCP without requiring a premium New Relic MCP plan.
 
 ## Why this project
 
@@ -26,7 +26,7 @@ This project helps teams use AI to debug issues by fetching New Relic logs throu
 - New Relic User API key
 - New Relic account id
 
-## Quick start for maintainers
+## Quick start
 
 1. Install dependencies.
 
@@ -46,11 +46,11 @@ npm run build
 npm test
 ```
 
-## VS Code setup for teammates (no clone/build)
+## VS Code setup (no clone/build)
 
 This is the primary usage model.
 
-1. Teammate sets local environment variables.
+1. Set local environment variables.
 
 ```bash
 export NEW_RELIC_DEFAULT_AUTH_MODE=api_key_only
@@ -59,7 +59,7 @@ export NEW_RELIC_API_KEY="YOUR_REAL_NEW_RELIC_USER_API_KEY"
 export NEW_RELIC_COOKIE=""
 ```
 
-2. Teammate adds this block to VS Code mcp.json.
+2. Add this block to VS Code mcp.json.
 
 ```json
 {
@@ -129,16 +129,10 @@ GitHub Actions workflow runs:
 
 Coverage artifacts are uploaded in each run.
 
-## Publishing checklist
+## Release notes
 
-1. Confirm no secrets are committed.
-2. Ensure .env.example uses placeholders only.
-3. Push to main.
-4. Tag a release, then recommend teammates pin to tag instead of main.
-
-Example pinned reference:
-
-- github:bhargavprajapati949/newrelic-lite-logs-mcp#v1.0.0
+- For stable installs, pin to a tag instead of main.
+- Example pinned source: github:YOUR_GITHUB_OWNER/newrelic-lite-logs-mcp#v1.0.0
 
 ## Security checklist
 
