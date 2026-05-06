@@ -1,0 +1,341 @@
+#!/usr/bin/env node
+
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
+import { buildClientFromEnv } from "./newrelic.js";
+import {
+  decodePageToken,
+  encodePageToken,
+  enforceReadOnlyQuery,
+  ensureTimeBound,
+  injectWindowAndLimit,
+  normalizeQuery,
+  redactObject,
+  withOffset,
+} from "./security.js";
+import { DryRunResult, InfraContext, QueryResult } from "./types.js";
+
+const MAX_LIMIT = 5000;
+
+const searchLogsSchema = z.object({
+  query: z.string().min(1),
+  accountId: z.number().int().positive().optional(),
+  since: z.string().optional(),
+  until: z.string().optional(),
+  limit: z.number().int().positive().max(MAX_LIMIT).optional(),
+  pageToken: z.string().optional(),
+});
+
+const getErrorLogsSchema = z.object({
+  accountId: z.number().int().positive().optional(),
+  serviceName: z.string().optional(),
+  since: z.string().optional(),
+  until: z.string().optional(),
+  limit: z.number().int().positive().max(MAX_LIMIT).optional(),
+  pageToken: z.string().optional(),
+});
+
+const summarizePatternsSchema = z.object({
+  accountId: z.number().int().positive().optional(),
+  since: z.string().optional(),
+  until: z.string().optional(),
+  limit: z.number().int().positive().max(200).optional(),
+});
+
+const discoverInfraSchema = z.object({
+  accountId: z.number().int().positive().optional(),
+  since: z.string().optional(),
+  until: z.string().optional(),
+  outputPath: z.string().optional(),
+});
+
+const dryRunSchema = z.object({
+  query: z.string().min(1),
+  since: z.string().optional(),
+  until: z.string().optional(),
+  limit: z.number().int().positive().max(MAX_LIMIT).optional(),
+});
+
+const client = buildClientFromEnv();
+
+function textResult(payload: unknown) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(payload, null, 2),
+      },
+    ],
+  };
+}
+
+function classifyError(error: unknown): { type: string; message: string } {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/Missing NEW_RELIC_API_KEY|Missing NEW_RELIC_COOKIE|Invalid env configuration/i.test(message)) {
+    return { type: "auth_error", message };
+  }
+
+  if (/only read-only NRQL|provide at least one of since\/until|rejected/i.test(message)) {
+    return { type: "query_validation_error", message };
+  }
+
+  if (/request failed \(429\)/i.test(message)) {
+    return { type: "rate_limited", message };
+  }
+
+  if (/request failed \(5\d\d\)/i.test(message)) {
+    return { type: "upstream_rejected", message };
+  }
+
+  if (/fetch failed|network/i.test(message)) {
+    return { type: "upstream_timeout", message };
+  }
+
+  return { type: "internal_error", message };
+}
+
+async function executeQuery(rawQuery: string, options: { accountId?: number; since?: string; until?: string; limit?: number; pageToken?: string }): Promise<QueryResult> {
+  enforceReadOnlyQuery(rawQuery);
+  ensureTimeBound(rawQuery, options.since, options.until);
+
+  const limit = Math.min(options.limit ?? 200, MAX_LIMIT);
+  const offset = decodePageToken(options.pageToken);
+  const query = withOffset(injectWindowAndLimit(rawQuery, options.since, options.until, limit), offset);
+
+  const startedAt = Date.now();
+  const rows = await client.runNrql(query, options.accountId);
+  const durationMs = Date.now() - startedAt;
+
+  const { redacted, redactionCount } = redactObject(rows);
+  const nextPageToken = rows.length >= limit ? encodePageToken(offset + limit) : undefined;
+
+  return {
+    summary: `Fetched ${rows.length} rows in ${durationMs}ms using ${client.authMode}.`,
+    query,
+    rows: redacted,
+    meta: {
+      durationMs,
+      rowsReturned: rows.length,
+      capped: rows.length >= limit,
+      redactionCount,
+      nextPageToken,
+      accountId: options.accountId ?? client.accountId,
+      authMode: client.authMode,
+    },
+  };
+}
+
+function makeDryRun(rawQuery: string, options: { since?: string; until?: string; limit?: number }): DryRunResult {
+  enforceReadOnlyQuery(rawQuery);
+  ensureTimeBound(rawQuery, options.since, options.until);
+
+  const normalizedQuery = injectWindowAndLimit(rawQuery, options.since, options.until, Math.min(options.limit ?? 200, MAX_LIMIT));
+  const warnings: string[] = [];
+
+  if (!/\bFROM\s+Log\b/i.test(normalizedQuery)) {
+    warnings.push("Query does not explicitly target Log events.");
+  }
+
+  return {
+    valid: true,
+    normalizedQuery: normalizeQuery(normalizedQuery),
+    warnings,
+  };
+}
+
+const server = new Server(
+  {
+    name: "newrelic-lite-logs-mcp",
+    version: "1.0.0",
+  },
+  {
+    capabilities: {
+      tools: {},
+    },
+  },
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: "search_logs",
+      description: "Run a read-only NRQL query for logs with time bounds and pagination.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          accountId: { type: "number" },
+          since: { type: "string" },
+          until: { type: "string" },
+          limit: { type: "number", maximum: MAX_LIMIT },
+          pageToken: { type: "string" },
+        },
+        required: ["query"],
+      },
+    },
+    {
+      name: "get_error_logs",
+      description: "Fetch recent error logs with optional service filter.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          accountId: { type: "number" },
+          serviceName: { type: "string" },
+          since: { type: "string" },
+          until: { type: "string" },
+          limit: { type: "number", maximum: MAX_LIMIT },
+          pageToken: { type: "string" },
+        },
+      },
+    },
+    {
+      name: "summarize_log_patterns",
+      description: "Summarize top error patterns by service and message.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          accountId: { type: "number" },
+          since: { type: "string" },
+          until: { type: "string" },
+          limit: { type: "number", maximum: 200 },
+        },
+      },
+    },
+    {
+      name: "discover_infra_context",
+      description: "Discover infra context from logs and write a draft context artifact.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          accountId: { type: "number" },
+          since: { type: "string" },
+          until: { type: "string" },
+          outputPath: { type: "string" },
+        },
+      },
+    },
+    {
+      name: "dry_run_query",
+      description: "Validate and normalize a read-only NRQL query without execution.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          since: { type: "string" },
+          until: { type: "string" },
+          limit: { type: "number", maximum: MAX_LIMIT },
+        },
+        required: ["query"],
+      },
+    },
+  ],
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  try {
+    const { name, arguments: args } = request.params;
+
+    if (name === "search_logs") {
+      const parsed = searchLogsSchema.parse(args ?? {});
+      const result = await executeQuery(parsed.query, parsed);
+      return textResult(result);
+    }
+
+    if (name === "get_error_logs") {
+      const parsed = getErrorLogsSchema.parse(args ?? {});
+      const serviceFilter = parsed.serviceName ? ` AND (service.name = '${parsed.serviceName}' OR entity.name = '${parsed.serviceName}')` : "";
+      const query = `SELECT timestamp, severity, message, service.name, entity.name, trace.id, span.id FROM Log WHERE (severity = 'ERROR' OR level = 'error' OR message LIKE '%error%')${serviceFilter} ORDER BY timestamp DESC`;
+      const result = await executeQuery(query, parsed);
+      return textResult(result);
+    }
+
+    if (name === "summarize_log_patterns") {
+      const parsed = summarizePatternsSchema.parse(args ?? {});
+      const query = "SELECT count(*) AS count FROM Log WHERE (severity = 'ERROR' OR level = 'error' OR message LIKE '%error%') FACET coalesce(service.name, entity.name, 'unknown'), message";
+      const result = await executeQuery(query, {
+        accountId: parsed.accountId,
+        since: parsed.since,
+        until: parsed.until,
+        limit: parsed.limit ?? 50,
+      });
+
+      result.summary = `Top ${result.rows.length} error patterns across services.`;
+      return textResult(result);
+    }
+
+    if (name === "discover_infra_context") {
+      const parsed = discoverInfraSchema.parse(args ?? {});
+      const qService = "SELECT uniques(coalesce(service.name, entity.name)) AS services FROM Log";
+      const qHosts = "SELECT uniques(hostname) AS hosts FROM Log";
+      const qClusters = "SELECT uniques(k8s.cluster.name) AS clusters FROM Log";
+      const qEnvs = "SELECT uniques(environment) AS environments FROM Log";
+
+      const [servicesRes, hostsRes, clustersRes, envRes] = await Promise.all([
+        executeQuery(qService, { accountId: parsed.accountId, since: parsed.since, until: parsed.until, limit: 1 }),
+        executeQuery(qHosts, { accountId: parsed.accountId, since: parsed.since, until: parsed.until, limit: 1 }),
+        executeQuery(qClusters, { accountId: parsed.accountId, since: parsed.since, until: parsed.until, limit: 1 }),
+        executeQuery(qEnvs, { accountId: parsed.accountId, since: parsed.since, until: parsed.until, limit: 1 }),
+      ]);
+
+      const pickArray = (rows: Array<Record<string, unknown>>, key: string): string[] => {
+        const arr = rows[0]?.[key];
+        if (!Array.isArray(arr)) {
+          return [];
+        }
+
+        return arr.map((v) => String(v)).filter(Boolean);
+      };
+
+      const infraContext: InfraContext = {
+        generatedAt: new Date().toISOString(),
+        accountId: parsed.accountId ?? client.accountId,
+        services: pickArray(servicesRes.rows, "services"),
+        hosts: pickArray(hostsRes.rows, "hosts"),
+        clusters: pickArray(clustersRes.rows, "clusters"),
+        environments: pickArray(envRes.rows, "environments"),
+        source: "newrelic.logs",
+      };
+
+      const outputPath = parsed.outputPath ?? "./infra_context.json";
+      const absolutePath = path.resolve(outputPath);
+      await mkdir(path.dirname(absolutePath), { recursive: true });
+      await writeFile(absolutePath, JSON.stringify(infraContext, null, 2), "utf8");
+
+      return textResult({
+        summary: `Discovered infra context and wrote ${absolutePath}.`,
+        infraContext,
+      });
+    }
+
+    if (name === "dry_run_query") {
+      const parsed = dryRunSchema.parse(args ?? {});
+      return textResult(makeDryRun(parsed.query, parsed));
+    }
+
+    throw new Error(`Unknown tool: ${name}`);
+  } catch (error) {
+    const classified = classifyError(error);
+    return textResult({
+      error: {
+        type: classified.type,
+        message: classified.message,
+      },
+    });
+  }
+});
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+main().catch((error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  // Avoid leaking details to stdout because MCP requires structured responses.
+  process.stderr.write(`Fatal startup error: ${message}\n`);
+  process.exit(1);
+});
