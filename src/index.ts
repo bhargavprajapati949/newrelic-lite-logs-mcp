@@ -6,6 +6,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { buildZeroResultDiagnostics, discoverInfraContext, discoverLogSchema, getAccountContext } from "./log-discovery.js";
 import { buildClientFromEnv } from "./newrelic.js";
 import {
   decodePageToken,
@@ -17,7 +18,7 @@ import {
   redactObject,
   withOffset,
 } from "./security.js";
-import { DryRunResult, InfraContext, QueryResult } from "./types.js";
+import { DryRunResult, QueryResult } from "./types.js";
 
 const MAX_LIMIT = 5000;
 
@@ -53,6 +54,18 @@ const discoverInfraSchema = z.object({
   outputPath: z.string().optional(),
 });
 
+const discoverLogSchemaSchema = z.object({
+  accountId: z.number().int().positive().optional(),
+  since: z.string().optional(),
+  until: z.string().optional(),
+});
+
+const accountContextSchema = z.object({
+  accountId: z.number().int().positive().optional(),
+  since: z.string().optional(),
+  until: z.string().optional(),
+});
+
 const dryRunSchema = z.object({
   query: z.string().min(1),
   since: z.string().optional(),
@@ -79,7 +92,7 @@ function classifyError(error: unknown): { type: string; message: string } {
     return { type: "auth_error", message };
   }
 
-  if (/only read-only NRQL|provide at least one of since\/until|rejected/i.test(message)) {
+  if (/only read-only NRQL|provide at least one of since\/until|Invalid date\/time string|Unknown function|rejected/i.test(message)) {
     return { type: "query_validation_error", message };
   }
 
@@ -109,14 +122,26 @@ async function executeQuery(rawQuery: string, options: { accountId?: number; sin
   const startedAt = Date.now();
   const rows = await client.runNrql(query, options.accountId);
   const durationMs = Date.now() - startedAt;
+  const accountContext = await getAccountContext(client, {
+    accountId: options.accountId,
+    since: options.since,
+    until: options.until,
+  });
 
   const { redacted, redactionCount } = redactObject(rows);
   const nextPageToken = rows.length >= limit ? encodePageToken(offset + limit) : undefined;
+  const diagnostics = rows.length === 0 ? await buildZeroResultDiagnostics(client, query, {
+    accountId: options.accountId,
+    since: options.since,
+    until: options.until,
+  }) : undefined;
 
   return {
     summary: `Fetched ${rows.length} rows in ${durationMs}ms using ${client.authMode}.`,
     query,
     rows: redacted,
+    accountContext,
+    diagnostics,
     meta: {
       durationMs,
       rowsReturned: rows.length,
@@ -144,6 +169,10 @@ function makeDryRun(rawQuery: string, options: { since?: string; until?: string;
     valid: true,
     normalizedQuery: normalizeQuery(normalizedQuery),
     warnings,
+    accountContext: {
+      accountId: client.accountId,
+      authMode: client.authMode,
+    },
   };
 }
 
@@ -219,6 +248,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "discover_log_schema",
+      description: "Inspect available recent log fields, likely service/environment fields, and common values.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          accountId: { type: "number" },
+          since: { type: "string" },
+          until: { type: "string" },
+        },
+      },
+    },
+    {
+      name: "get_account_context",
+      description: "Show the current New Relic account context and whether recent logs exist in the selected window.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          accountId: { type: "number" },
+          since: { type: "string" },
+          until: { type: "string" },
+        },
+      },
+    },
+    {
       name: "dry_run_query",
       description: "Validate and normalize a read-only NRQL query without execution.",
       inputSchema: {
@@ -255,7 +308,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (name === "summarize_log_patterns") {
       const parsed = summarizePatternsSchema.parse(args ?? {});
-      const query = "SELECT count(*) AS count FROM Log WHERE (severity = 'ERROR' OR level = 'error' OR message LIKE '%error%') FACET coalesce(service.name, entity.name, 'unknown'), message";
+      const query = "SELECT count(*) AS count FROM Log WHERE (severity = 'ERROR' OR level = 'error' OR message LIKE '%error%') FACET service.name, entity.name, message";
       const result = await executeQuery(query, {
         accountId: parsed.accountId,
         since: parsed.since,
@@ -269,36 +322,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (name === "discover_infra_context") {
       const parsed = discoverInfraSchema.parse(args ?? {});
-      const qService = "SELECT uniques(coalesce(service.name, entity.name)) AS services FROM Log";
-      const qHosts = "SELECT uniques(hostname) AS hosts FROM Log";
-      const qClusters = "SELECT uniques(k8s.cluster.name) AS clusters FROM Log";
-      const qEnvs = "SELECT uniques(environment) AS environments FROM Log";
-
-      const [servicesRes, hostsRes, clustersRes, envRes] = await Promise.all([
-        executeQuery(qService, { accountId: parsed.accountId, since: parsed.since, until: parsed.until, limit: 1 }),
-        executeQuery(qHosts, { accountId: parsed.accountId, since: parsed.since, until: parsed.until, limit: 1 }),
-        executeQuery(qClusters, { accountId: parsed.accountId, since: parsed.since, until: parsed.until, limit: 1 }),
-        executeQuery(qEnvs, { accountId: parsed.accountId, since: parsed.since, until: parsed.until, limit: 1 }),
-      ]);
-
-      const pickArray = (rows: Array<Record<string, unknown>>, key: string): string[] => {
-        const arr = rows[0]?.[key];
-        if (!Array.isArray(arr)) {
-          return [];
-        }
-
-        return arr.map((v) => String(v)).filter(Boolean);
-      };
-
-      const infraContext: InfraContext = {
-        generatedAt: new Date().toISOString(),
-        accountId: parsed.accountId ?? client.accountId,
-        services: pickArray(servicesRes.rows, "services"),
-        hosts: pickArray(hostsRes.rows, "hosts"),
-        clusters: pickArray(clustersRes.rows, "clusters"),
-        environments: pickArray(envRes.rows, "environments"),
-        source: "newrelic.logs",
-      };
+      const infraContext = await discoverInfraContext(client, {
+        accountId: parsed.accountId,
+        since: parsed.since,
+        until: parsed.until,
+      });
 
       const outputPath = parsed.outputPath ?? "./infra_context.json";
       const absolutePath = path.resolve(outputPath);
@@ -308,6 +336,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return textResult({
         summary: `Discovered infra context and wrote ${absolutePath}.`,
         infraContext,
+      });
+    }
+
+    if (name === "discover_log_schema") {
+      const parsed = discoverLogSchemaSchema.parse(args ?? {});
+      const result = await discoverLogSchema(client, parsed);
+      return textResult(result);
+    }
+
+    if (name === "get_account_context") {
+      const parsed = accountContextSchema.parse(args ?? {});
+      const result = await getAccountContext(client, parsed);
+      return textResult({
+        summary: `Account ${result.accountId} has ${result.totalLogsInWindow} logs in the selected window.`,
+        accountContext: result,
       });
     }
 

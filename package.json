@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "newrelic-custom-mcp": "dist/index.js"
+    "newrelic-lite-logs-mcp": "dist/index.js"
   },
   "files": [
     "dist",

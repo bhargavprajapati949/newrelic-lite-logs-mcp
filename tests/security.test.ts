@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ensureTimeBound, enforceReadOnlyQuery, redactObject } from "../src/security.js";
+import { ensureTimeBound, enforceReadOnlyQuery, injectWindowAndLimit, redactObject } from "../src/security.js";
 
 describe("query guardrails", () => {
   it("rejects mutation-like query", () => {
@@ -9,6 +9,11 @@ describe("query guardrails", () => {
   it("requires at least one time bound", () => {
     expect(() => ensureTimeBound("SELECT * FROM Log")).toThrow(/since\/until/i);
     expect(() => ensureTimeBound("SELECT * FROM Log", "30 minutes ago", undefined)).not.toThrow();
+  });
+
+  it("formats relative and absolute time windows correctly", () => {
+    expect(injectWindowAndLimit("SELECT * FROM Log", "24 hours ago", undefined, 1)).toContain("SINCE 24 hours ago");
+    expect(injectWindowAndLimit("SELECT * FROM Log", "2026-05-01 00:00:00", undefined, 1)).toContain("SINCE '2026-05-01 00:00:00'");
   });
 });
 

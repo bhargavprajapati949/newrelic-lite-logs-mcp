@@ -38,15 +38,33 @@ export function normalizeQuery(query: string): string {
   return query.replace(/\s+/g, " ").trim();
 }
 
+function formatNrqlTime(value: string): string {
+  const trimmed = value.trim();
+
+  if (/^['"].*['"]$/.test(trimmed)) {
+    return trimmed;
+  }
+
+  if (/^\d+$/.test(trimmed)) {
+    return trimmed;
+  }
+
+  if (/^(now|today|yesterday|this\s+|last\s+|\d+\s+(minute|minutes|hour|hours|day|days|week|weeks|month|months)\s+ago)/i.test(trimmed)) {
+    return trimmed;
+  }
+
+  return `'${trimmed}'`;
+}
+
 export function injectWindowAndLimit(query: string, since?: string, until?: string, limit?: number): string {
   let q = normalizeQuery(query);
 
   if (since && !/\bSINCE\b/i.test(q)) {
-    q = `${q} SINCE '${since}'`;
+    q = `${q} SINCE ${formatNrqlTime(since)}`;
   }
 
   if (until && !/\bUNTIL\b/i.test(q)) {
-    q = `${q} UNTIL '${until}'`;
+    q = `${q} UNTIL ${formatNrqlTime(until)}`;
   }
 
   if (typeof limit === "number") {
